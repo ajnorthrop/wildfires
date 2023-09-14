@@ -1,0 +1,232 @@
+####***********************
+#### Code Description ####
+# Author: Alex
+# Date: 11/20/2022
+# Last Update: 9/13/23
+# Goal: PM2.5 Updated Rolling Metrics
+####**********************
+
+
+# Read libraries 
+
+library(tidyverse)
+library(here)
+library(sf)
+library(data.table)
+library(lubridate)
+library(zoo)
+
+# Study FIPS 
+
+kpsc_fips = c("025","073","065","059","071","037","111","029",'083',"079")
+
+# From TIGRIS file (update if needed)
+
+cact <- read_sf(here("data","shapes","ca_cts_google_drive")) %>% 
+  janitor::clean_names() %>%
+  mutate(geoid = str_remove(geoid, "^0+")) %>% 
+  filter(countyfp %in% kpsc_fips) %>% 
+  mutate(geoid = as.double(geoid))
+
+kpsc_cts <- as.data.frame(cact) %>% 
+  select(geoid)
+
+# WFPM Data 
+
+# Read in data 
+wfpm <- fread(here("data","wfpm_updated2023","raw","wfpm25_CT_2006to2020_updated_Aug2023.csv")) %>% 
+  mutate(geoid = as.character(geoid)) %>% 
+  rename(ml_pm25 = ml_pm25_aug2023) %>% 
+  rename(wf_pm25_imp = wf_pm25_aug2023)
+
+# Create week and year (edited)
+
+wfpm <- wfpm %>% 
+  mutate(week = week(date)) %>% 
+  mutate(year = year(date)) %>% 
+  mutate(month = month(date))
+
+# Filter GEOIDs to create KP-specific dataset 
+
+kpsc_wfpm <- wfpm %>% 
+  filter(geoid %in% kpsc_cts$geoid) 
+
+########## Frequency ###########
+
+# How often exposed?
+# 1.
+# Number of weeks with average wildfires PM2.5 > 5 ug/m3
+# Rolling 3-year monthly 
+
+monthly_exposure <- kpsc_wfpm %>% 
+  group_by(geoid,week,year, month) %>% # edited to remove duplicate weeks 
+  summarize(weekly_pm = mean(wf_pm25_imp)) %>%
+  ungroup() %>% 
+  mutate(exposed = ifelse(weekly_pm > 5, 1,0)) %>% 
+  group_by(geoid, year, month) %>%  
+  summarize(exposed = sum(exposed)) %>% 
+  ungroup() %>%
+  mutate(date = paste0(year,"-",month)) %>% 
+  mutate(date = zoo::as.yearmon(date, "%Y-%m")) %>% 
+  arrange(date)
+
+rolling_frequency <- monthly_exposure %>%
+  group_by(geoid) %>%
+  mutate(rolling_freq = zoo::rollapply(exposed, 36, sum, na.rm = TRUE, 
+                                       align = 'right', partial = TRUE)) 
+
+rolling_frequency <- rolling_frequency %>%
+  select(geoid, date, rolling_freq) %>% 
+  mutate(geoid = as.character(geoid),
+         date = zoo::as.yearmon(date))
+
+write_csv(rolling_frequency, here("data","wfpm_updated2023","frequency","r_kpsc_wfpm_freq_monthly_09132023.csv"))
+
+# How often exposed?
+# 2.
+# Total number of non-zero days 
+# Rolling 3-years, updated monthly 
+
+wfpm_days <- wfpm %>% 
+  filter(geoid %in% kpsc_cts$geoid) %>%
+  group_by(geoid) %>% 
+  mutate(non_zero = ifelse(wf_pm25_imp > 0, 1, 0)) 
+
+# Monthly 
+
+wfpm_days_m <- wfpm_days %>% 
+  group_by(geoid, month, year) %>%
+  summarize(non_zero_days = sum(non_zero)) %>% 
+  ungroup() %>% 
+  select(geoid,year, month,non_zero_days) %>% 
+  mutate(date = paste0(year,"-",month)) %>% 
+  mutate(date = zoo::as.yearmon(date, "%Y-%m")) %>% 
+  arrange(date)
+
+rolling_exposed_1 <- wfpm_days_m %>%
+  group_by(geoid) %>%
+  mutate(rolling_non_zero = zoo::rollapply(non_zero_days, 36, sum, na.rm = TRUE, 
+                                           align = 'right', partial = TRUE)) 
+
+rolling_exposed_1 <- rolling_exposed_1 %>%
+  select(geoid, date, rolling_non_zero)
+
+write_csv(rolling_exposed_1, here("data","wfpm_updated2023","duration","r_kpsc_wfpm_dur_monthly_09132023.csv"))
+
+# Number of smoke waves 
+# 3. 
+# Defined as 2_ days over the study area 95th percentile of wildfire PM2.5 
+# Rolling 3-year monthly 
+
+#   use 90th percentile of new estimates for wf_pm25_aug2023 > 0 = 15  #
+
+wfpm_sw <- wfpm %>% 
+  mutate(flag = ifelse(wf_pm25_imp > 15, 1,0)) # Change threshold here, as needed 
+
+smoke_wave_m <- wfpm_sw %>% 
+  group_by(geoid, group = rleid(flag > 0)) %>% 
+  mutate(smoke_wave = ifelse(sum(flag) > 1, 1, 0)) %>%
+  filter(row_number() == 1) %>% 
+  ungroup() %>% 
+  group_by(month, year, geoid) %>% 
+  summarize(smoke_waves = sum(smoke_wave)) %>% 
+  ungroup()
+
+smoke_wave_m_int <- smoke_wave_m %>% 
+  mutate(date = paste0(year,"-",month)) %>%
+  mutate(date = zoo::as.yearmon(date, "%Y-%m"))
+
+smoke_wave_m_int2 <- rolling_exposed_1 %>% 
+  left_join(smoke_wave_m_int, by = c("geoid","date")) %>% 
+  mutate(month = month(date),
+         year = year(date),
+         smoke_waves = ifelse(is.na(smoke_waves), 0, smoke_waves))
+
+rolling_exposed_2 <- smoke_wave_m_int2 %>%
+  group_by(geoid) %>%
+  mutate(rolling_smoke_waves = zoo::rollapply(smoke_waves, 36, sum, na.rm = TRUE, 
+                                              align = 'right', partial = TRUE)) 
+
+rolling_exposed_2 <- rolling_exposed_2 %>%
+  select(geoid, date, rolling_smoke_waves) 
+
+write_csv(rolling_exposed_2, here("data","wfpm_updated2023","duration","r_kpsc_wfpm_dur_smokewave_monthly_09132023.csv"))
+
+# To what level exposed?
+# Peak 
+# 4.
+# Average daily wf pm2.5 during peak week 
+
+pm_weekly <- wfpm %>% 
+  filter(geoid %in% kpsc_cts$geoid) %>%
+  group_by(geoid, month,week,year) %>% 
+  summarize(week_pm = mean(wf_pm25_imp)) %>% 
+  ungroup()
+
+peak_pm_m <- pm_weekly %>% 
+  group_by(geoid,month, year) %>% 
+  summarize(peak_pm = max(week_pm)) %>% 
+  ungroup() %>% 
+  select(geoid,year, month, peak_pm) %>%
+  mutate(date = paste0(year,"-",month)) %>% 
+  mutate(date = zoo::as.yearmon(date, "%Y-%m")) %>% 
+  arrange(date)
+
+rolling_peak <- peak_pm_m %>%
+  group_by(geoid) %>%
+  mutate(rolling_peak = zoo::rollapply(peak_pm, 36, max, na.rm = TRUE, 
+                                       align = 'right', partial = TRUE)) 
+
+rolling_peak <- rolling_peak %>%
+  select(geoid, date, rolling_peak) %>% 
+  mutate(geoid = as.character(geoid))
+
+write_csv(rolling_peak, here("data","wfpm_updated2023","concentration","r_kpsc_wfpm_peak_monthly_09132023.csv"))
+
+# Average
+# 5.
+# Sum of wf pm2.5
+
+avg_pm_m <- wfpm %>%
+  filter(geoid %in% kpsc_cts$geoid) %>%
+  dplyr::select(geoid,year, month, date, wf_pm25_imp, ml_pm25) %>% 
+  mutate(non_wf_pm = (ml_pm25 - wf_pm25_imp)) %>%
+  arrange(date)
+
+rolling_average <- avg_pm_m %>%
+  group_by(geoid) %>%
+  mutate(rolling_avg_wf_pm = zoo::rollapply(wf_pm25_imp, 1095, mean, na.rm = TRUE, 
+                                            align = 'right', partial = TRUE)) %>%
+  ungroup() %>% 
+  dplyr::select(geoid, date, rolling_avg_wf_pm, non_wf_pm)
+
+rolling_average <- rolling_average %>%
+  group_by(geoid) %>%
+  mutate(rolling_avg_nonwfpm = zoo::rollapply(non_wf_pm, 1095, mean, na.rm = TRUE, 
+                                              align = 'right', partial = TRUE)) %>%
+  select(geoid, date, rolling_avg_wf_pm, rolling_avg_nonwfpm)
+
+rolling_average_monthly <- rolling_average %>%
+  filter(1 == day(date)) %>% 
+  mutate(date = as.yearmon(date)) 
+
+write_csv(rolling_average_monthly, here("data","wfpm_updated2023","average","r_kpsc_wfpm_average_monthly_09132023.csv"))
+
+# Combine into a single dataset 
+
+# Load
+
+rolling_frequency <- read_csv(here("data","wfpm_updated2023","frequency","r_kpsc_wfpm_freq_monthly_09132023.csv"))
+non_zero  <- read_csv( here("data","wfpm_updated2023","duration","r_kpsc_wfpm_dur_monthly_09132023.csv"))
+smoke_wave <- read_csv(here("data","wfpm_updated2023","duration","r_kpsc_wfpm_dur_smokewave_monthly_09132023.csv"))
+peak <- read_csv(here("data","wfpm_updated2023","concentration","r_kpsc_wfpm_peak_monthly_09132023.csv"))
+rolling_average_monthly <- read_csv(here("data","wfpm_updated2023","average","r_kpsc_wfpm_average_monthly_09132023.csv"))
+
+rolling_pm_metrics <- rolling_frequency %>% 
+  left_join(non_zero, by = c("geoid","date")) %>% 
+  left_join(smoke_wave, by = c("geoid","date")) %>% 
+  left_join(peak, by = c("geoid","date")) %>% 
+  left_join(rolling_average_monthly, by = c("geoid","date")) 
+
+saveRDS(rolling_pm_metrics, here("data","wfpm_updated2023","aggregate","rolling_pm_metrics_09132023.RData"))
+write.csv(rolling_pm_metrics, here("data","wfpm_updated2023", "aggregate", "rolling_pm_metrics_09132023.csv"), row.names = FALSE)
